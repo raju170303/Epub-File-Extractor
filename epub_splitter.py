@@ -57,7 +57,7 @@ from PySide6.QtCore import Qt, QTimer
 # -----------------------------
 # Config / rules
 # -----------------------------
-CHAPTER_REGEX = re.compile(r"^ch(\d{2})\.(xhtml|html)$", re.IGNORECASE)
+CHAPTER_REGEX = re.compile(r"^(?:ch|chp)[-_]?(\d{2,3})\.(xhtml|html)$", re.IGNORECASE)
 IMG_PREFIX_FMT = "fig{num:02d}_"  # chapter images: figNN_
 
 # FM label → candidate basenames (without extension)
@@ -472,7 +472,7 @@ class EpubSplitterApp(QWidget):
             lay.addWidget(chk)
 
         lay.addWidget(QLabel("Detection Rule (regex for chapter files):"))
-        self.rule = QLineEdit(r"^ch(\d{2})\.(xhtml|html)$")
+        self.rule = QLineEdit(r"^(?:ch|chp)[-_]?(\d{2,3})\.(xhtml|html)$")
         lay.addWidget(self.rule)
 
         next_btn = QPushButton("Next →"); next_btn.clicked.connect(lambda: self.pages.setCurrentIndex(2))
