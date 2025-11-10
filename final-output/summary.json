@@ -1,0 +1,13 @@
+{
+  "chapters_built": [],
+  "fm_built": true,
+  "index_built": true,
+  "warnings": [
+    "WARNING: FM missing: 'Copyright' (searched ['copyright', 'copyright-page'] in C:\\Users\\murugas\\AppData\\Local\\Temp\\epubsplit-yeh3utpj\\unzipped-35fe11f314934423b7da27046833fe44\\OEBPS\\xhtml)",
+    "WARNING: FM missing: 'About the Editor' (searched ['about-editor', 'about_the_editor', 'editor'] in C:\\Users\\murugas\\AppData\\Local\\Temp\\epubsplit-yeh3utpj\\unzipped-35fe11f314934423b7da27046833fe44\\OEBPS\\xhtml)",
+    "WARNING: FM missing: 'About the Contributors' (searched ['about-contributors', 'about_the_contributors', 'contributors'] in C:\\Users\\murugas\\AppData\\Local\\Temp\\epubsplit-yeh3utpj\\unzipped-35fe11f314934423b7da27046833fe44\\OEBPS\\xhtml)",
+    "WARNING: FM nav: link target missing for 'Copyright' (searched ['copyright', 'copyright-page'])",
+    "WARNING: FM nav: link target missing for 'About the Editor' (searched ['about-editor', 'about_the_editor', 'editor'])",
+    "WARNING: FM nav: link target missing for 'About the Contributors' (searched ['about-contributors', 'about_the_contributors', 'contributors'])"
+  ]
+}
