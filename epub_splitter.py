@@ -1,590 +1,966 @@
 #!/usr/bin/env python3
 """
-Final App: EPUB → Per-section ZIP Splitter (GUI + Backend)
+epub_splitter_gui.py — robust nav handling + exact nav.xhtml templates.
 
-What this app does:
-- Lets the user pick an input .epub.
-- Unzips it to a temp workspace and reads its structure.
-- Detects chapters by filename pattern: ^ch(\d{2})\.(xhtml|html)$ in OEBPS/xhtml/.
-- For each detected chapter N, creates a ZIP named chNN.zip containing:
-  - mimetype, META-INF/* (copied),
-  - OEBPS/fonts/* and OEBPS/styles/* (copied whole),
-  - OEBPS/xhtml/chNN.(x)html only,
-  - OEBPS/images/figNN_* only,
-  - contents.opf and toc.ncx (copied from input; no trimming).
-- Creates FM.zip that contains front-matter xhtml files (resolved by names) and a generated OEBPS/xhtml/nav.html:
-  - <h1>Contents</h1> at the top
-  - A list item "Contents" that links to toc.(x)html if found
-  - Then: Cover Page, Half Title Page, Title Page, Copyright,
-          About the Editor, About the Contributors (linked where resolvable)
-- Creates index.zip that contains the existing index.(x)html (no generated nav in index; we copy the real index page you have).
-- Produces a master final-output.zip that contains chNN.zip, FM.zip, index.zip.
-- Writes run-log.txt and summary.json into the chosen output folder (next to final-output.zip).
-
-Notes:
-- No HTML parsing to find <img>; images are selected purely by name prefix figNN_.
-- Warnings only (no auto-fixes) if expected files are missing.
-- You can tweak CHAPTER_REGEX and FM_RESOLUTION_TABLE below if your naming differs.
-
-Requires:
-  PySide6
-Tested on Python 3.10+.
+Drop-in replacement for your existing ui script. This version includes:
+ - robust nav parsing (prefers epub:type="toc", falls back to full-file scan)
+ - better title extraction from chapter/FM files
+ - includes FM files referenced by nav (fm1.xhtml/fm2.xhtml) when staging FM.epub
+ - generates nav.xhtml inside staged EPUBs matching your expected head/body/nav structure
+ - debug logging written to run-log.txt
 """
 from __future__ import annotations
-
-import json
 import os
 import re
-import shutil
 import sys
-import tempfile
-import time
+import json
 import uuid
+import shutil
 import zipfile
-from dataclasses import dataclass, asdict
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+import html as _html
 
-# -----------------------------
-# PySide6 GUI imports
-# -----------------------------
+# GUI
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog,
-    QProgressBar, QListWidget, QTextEdit, QStackedWidget, QCheckBox, QLineEdit
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFileDialog, QProgressBar, QTextEdit, QLineEdit, QListWidget
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 
 # -----------------------------
-# Config / rules
+# Config / patterns
 # -----------------------------
-CHAPTER_REGEX = re.compile(r"^(?:ch|chp)[-_]?(\d{2,3})\.(xhtml|html)$", re.IGNORECASE)
-IMG_PREFIX_FMT = "fig{num:02d}_"  # chapter images: figNN_
+CHAPTER_REGEX = re.compile(r"^(?:ch|chp)[-_]?(\d{1,3})\.(xhtml|html)$", re.IGNORECASE)
 
-# FM label → candidate basenames (without extension)
-FM_RESOLUTION_TABLE: Dict[str, List[str]] = {
-    "Contents": ["toc", "contents"],
-    "Cover Page": ["cover"],
-    "Half Title Page": ["half", "half-title"],
-    "Title Page": ["tit", "title"],
-    "Copyright": ["copyright", "copyright-page"],
+FM_KEYWORDS: Dict[str, List[str]] = {
+    "Cover Page": ["cover", "cover-page"],
+    "Half Title Page": ["half", "half-title", "halftitle"],
+    "Title Page": ["title", "tit", "title-page"],
+    "Copyright": ["copyright", "copyright-page", "copy"],
     "About the Editor": ["about-editor", "about_the_editor", "editor"],
-    "About the Contributors": ["about-contributors", "about_the_contributors", "contributors"],
+    "About the Contributors": ["about-contributors", "contributors", "about_the_contributors"],
 }
-
-FM_CANONICAL_ORDER = [
-    "Contents",
-    "Cover Page",
-    "Half Title Page",
-    "Title Page",
-    "Copyright",
-    "About the Editor",
-    "About the Contributors",
+FM_ORDER = [
+    "Cover Page", "Half Title Page", "Title Page",
+    "Copyright", "About the Editor", "About the Contributors"
 ]
+INDEX_KEYWORDS = ["index"]
 
-BACK_MATTER_INDEX_CANDIDATES = ["index"]  # for index.zip
+# Diagnostics toggle
+DEBUG = True
 
 # -----------------------------
-# Logging helpers
+# Simple logging
 # -----------------------------
 @dataclass
 class RunLog:
     messages: List[str]
     warnings: List[str]
+
     def log(self, msg: str):
         print(msg)
         self.messages.append(msg)
+
     def warn(self, msg: str):
         w = f"WARNING: {msg}"
         print(w, file=sys.stderr)
         self.warnings.append(w)
-    def dump_files(self, out_root: Path):
-        (out_root / "run-log.txt").write_text("\n".join(self.messages + self.warnings), encoding="utf-8")
+
+    def dump(self, out_dir: Path):
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "run-log.txt").write_text("\n".join(self.messages + self.warnings), encoding="utf-8")
+        except Exception:
+            pass
 
 # -----------------------------
-# Backend: EPUB processing
+# Helpers
 # -----------------------------
-
-def unzip_epub(epub_path: Path, workdir: Path, log: RunLog) -> Path:
-    dst = workdir / f"unzipped-{uuid.uuid4().hex}"
-    dst.mkdir(parents=True, exist_ok=True)
-    log.log(f"Unzipping EPUB: {epub_path}")
-    with zipfile.ZipFile(epub_path, 'r') as z:
-        z.extractall(dst)
-    return dst
-
-
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
+def write_text(p: Path, text: str):
+    ensure_dir(p.parent)
+    p.write_text(text, encoding="utf-8")
 
-def detect_chapters(xhtml_dir: Path, log: RunLog) -> List[Tuple[int, Path]]:
-    chapters: List[Tuple[int, Path]] = []
-    for p in xhtml_dir.glob("*.*html"):
-        m = CHAPTER_REGEX.match(p.name)
-        if m:
-            num = int(m.group(1))
-            chapters.append((num, p))
-    chapters.sort(key=lambda t: t[0])
-    log.log(f"Detected chapters: {[f'ch{n:02d}' for n,_ in chapters]} (in {xhtml_dir})")
-    return chapters
+def get_subdir_case_insensitive(parent: Path, preferred: str) -> Path:
+    pref = parent / preferred
+    if pref.exists():
+        return pref
+    if not parent.exists():
+        return pref
+    want = preferred.lower()
+    for child in parent.iterdir():
+        if child.is_dir() and child.name.lower() == want:
+            return child
+    return pref
 
+# -----------------------------
+# nav parsing & sanitize
+# -----------------------------
+LI_PATTERN = re.compile(r'<li\b[^>]*>(.*?)</li>', re.DOTALL | re.IGNORECASE)
+HREF_PATTERN = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
+A_TAG_PATTERN = re.compile(r'<a\b([^>]*)>(.*?)</a>', re.IGNORECASE | re.DOTALL)
 
-def find_first_existing(base_dir: Path, names_wo_ext: List[str]) -> Optional[Path]:
-    for stem in names_wo_ext:
-        for ext in (".xhtml", ".html"):
-            cand = base_dir / f"{stem}{ext}"
-            if cand.exists():
-                return cand
-        # fallback: contains match
-        for ext in (".xhtml", ".html"):
-            hits = list(base_dir.glob(f"*{stem}*{ext}"))
-            if hits:
-                return hits[0]
+def extract_original_nav_and_raw(xhtml_dir: Path, log: RunLog) -> Tuple[str, str]:
+    """
+    Read nav.* from OEBPS/xhtml and return tuple (preferred_nav_html, raw_full_nav_file_text).
+    preferred_nav_html is the primary <nav> block for TOC (epub:type="toc" etc) when found;
+    raw_full is the full file contents (used for fallback anchor scanning).
+    """
+    if not xhtml_dir.exists():
+        log.warn("xhtml directory not found in EPUB.")
+        return "", ""
+    cands = sorted(list(xhtml_dir.glob("nav.*")))
+    if not cands:
+        cands = [p for p in xhtml_dir.iterdir() if p.is_file() and p.name.lower().startswith("nav.")]
+    if not cands:
+        log.warn("No nav file found in input xhtml directory.")
+        return "", ""
+    try:
+        raw = cands[0].read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        log.warn(f"Failed to read nav file: {e}")
+        return "", ""
+    # Try to find the primary TOC <nav> block
+    m = re.search(r'<nav\b[^>]*\bepub:type\s*=\s*["\']toc["\'][^>]*>(.*?)</nav>', raw, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        m = re.search(r'<nav\b[^>]*(?:\brole\s*=\s*["\']doc-toc["\']|\baria-labelledby\s*=\s*["\']contents["\'])[^\>]*>(.*?)</nav>',
+                      raw, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        m = re.search(r'(<nav\b[^>]*>[\s\S]*?</nav>)', raw, flags=re.IGNORECASE | re.DOTALL)
+    nav_html = m.group(0) if m else ""
+    return nav_html, raw
+
+def parse_nav_items_from_nav_html(nav_raw: str) -> List[Tuple[str, str]]:
+    """
+    Parse only the first <ol> inside the provided <nav> HTML and return list of (text, href).
+    """
+    items: List[Tuple[str, str]] = []
+    if not nav_raw:
+        return items
+
+    ol_m = re.search(r'<ol\b[^>]*>(.*?)</ol>', nav_raw, flags=re.IGNORECASE | re.DOTALL)
+    ol_content = ol_m.group(1) if ol_m else nav_raw
+
+    for li in LI_PATTERN.findall(ol_content):
+        href_m = HREF_PATTERN.search(li)
+        href = href_m.group(1) if href_m else ""
+        text = re.sub(r'<[^>]+>', '', li).strip()
+        text = re.sub(r'\s+', ' ', text)
+        items.append((text, href))
+    return items
+
+def sanitize_nav_xhtml(raw: str) -> str:
+    s = (raw or "").lstrip()
+    if not s.startswith("<?xml"):
+        s = '<?xml version="1.0" encoding="utf-8"?>\n' + s
+    s = re.sub(r'(?i)<!doctype\s+html[^>]*>', '<!DOCTYPE html>', s, count=1)
+    m = re.search(r'<html\b([^>]*)>', s, flags=re.IGNORECASE)
+    if m:
+        attrs = m.group(1)
+        def has_attr(rx): return re.search(rx, attrs, flags=re.IGNORECASE) is not None
+        adds = []
+        if not has_attr(r'\bxmlns\b'):
+            adds.append('xmlns="http://www.w3.org/1999/xhtml"')
+        if not has_attr(r'\bxmlns:epub\b'):
+            adds.append('xmlns:epub="http://www.idpf.org/2007/ops"')
+        if not has_attr(r'\bxml:lang\b'):
+            adds.append('xml:lang="en"')
+        if not has_attr(r'\blang\b'):
+            adds.append('lang="en"')
+        if adds:
+            new_attrs = attrs.rstrip() + ' ' + ' '.join(adds)
+            s = s[:m.start()] + '<html' + new_attrs + '>' + s[m.end():]
+    else:
+        body_m = re.search(r'(<body\b[\s\S]*</body>)', s, flags=re.IGNORECASE)
+        body = body_m.group(1) if body_m else '<body></body>'
+        s = '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n' \
+            '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="en" lang="en">\n' \
+            '  <head><meta charset="utf-8"/><title>nav</title></head>\n' + body + '\n</html>\n'
+    if not s.endswith("\n"):
+        s += "\n"
+    return s
+
+# -----------------------------
+# title extraction (robust)
+# -----------------------------
+def _clean_html_text(s: str) -> str:
+    s2 = re.sub(r'<[^>]+>', '', s)
+    s2 = re.sub(r'\s+', ' ', s2).strip()
+    return _html.unescape(s2)
+
+def extract_title_from_xhtml(xhtml_path: Path) -> str:
+    try:
+        txt = xhtml_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return xhtml_path.name
+
+    m = re.search(r'<h1[^>]*>(.*?)</h1>', txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        title = _clean_html_text(m.group(1))
+        if title:
+            return title
+
+    m = re.search(r'<([a-z0-9]+)[^>]*\bepub:type=["\']title["\'][^>]*>(.*?)</\1>', txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        title = _clean_html_text(m.group(2))
+        if title:
+            return title
+
+    m = re.search(r'<([a-z0-9]+)[^>]*\bclass=["\'][^"\']*(chapter[-_ ]?title|chapterTitle|title|book-title|part-title)[^"\']*["\'][^>]*>(.*?)</\1>',
+                  txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        title = _clean_html_text(m.group(2))
+        if title:
+            return title
+
+    m = re.search(r'<h[23][^>]*>(.*?)</h[23]>', txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        title = _clean_html_text(m.group(1))
+        if title:
+            return title
+
+    m = re.search(r'<title[^>]*>(.*?)</title>', txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        title = _clean_html_text(m.group(1))
+        if title:
+            return title
+
+    return xhtml_path.name
+
+# -----------------------------
+# classify nav items (stricter)
+# -----------------------------
+def classify_nav_items(items: List[Tuple[str, str]], log: RunLog):
+    fm_items: List[Tuple[str,str]] = []
+    chapter_map: Dict[int, Tuple[str,str]] = {}
+    index_item: Optional[Tuple[str,str]] = None
+
+    # Find the position of the first chapter-like item in the nav sequence.
+    first_chapter_idx = None
+    for idx, (text, href) in enumerate(items):
+        href_basename = Path(href).name if href else ""
+        # chapter detection heuristics (same approach as below)
+        if href_basename:
+            if CHAPTER_REGEX.match(href_basename):
+                first_chapter_idx = idx
+                break
+            # href starting with 'ch'/'chp' and has digits
+            if re.match(r'(?i)^(ch|chp|chapter)', href_basename) and re.search(r'(\d{1,3})', href_basename):
+                first_chapter_idx = idx
+                break
+        # text-based "Chapter N" detection
+        if text and re.search(r'\bchapter\b', text, flags=re.IGNORECASE) and re.search(r'\b(\d{1,3})\b', text):
+            first_chapter_idx = idx
+            break
+    # if none found, treat entire nav as having no boundary (first_chapter_idx stays None)
+
+    for idx, (text, href) in enumerate(items):
+        lower_text = (text or "").lower()
+        href_basename = Path(href).name if href else ""
+        href_lower = href_basename.lower()
+
+        # If a candidate is after the first chapter boundary, don't treat it as FM.
+        is_before_chapters = (first_chapter_idx is None) or (idx < first_chapter_idx)
+
+        # FM detection: only for items that are before the first chapter anchor.
+        matched_fm = False
+        if is_before_chapters:
+            for label, keys in FM_KEYWORDS.items():
+                for k in keys:
+                    if k in lower_text or k in href_lower:
+                        fm_items.append((label, href))
+                        matched_fm = True
+                        break
+                if matched_fm:
+                    break
+        if matched_fm:
+            continue
+
+        # Index detection (index may appear after chapters too)
+        if any(k in lower_text or k in href_lower for k in INDEX_KEYWORDS):
+            index_item = (text, href)
+            continue
+
+        # Chapter detection
+        num = None
+        if href_basename:
+            m_href = re.search(r'(\d{1,3})', href_basename)
+            if m_href:
+                num = int(m_href.group(1))
+        if num is None:
+            m_text = re.search(r'\b(\d{1,3})\b', text or "")
+            if m_text:
+                num = int(m_text.group(1))
+
+        if num is not None:
+            if num in chapter_map:
+                log.warn(f"Duplicate nav entry for chapter {num}: keeping previous entry, ignored '{text}'")
+            else:
+                chapter_map[num] = (text, href)
+            continue
+
+        # fallback: match filename pattern ch/chpN
+        m_file = CHAPTER_REGEX.match(href_basename)
+        if m_file:
+            num = int(m_file.group(1))
+            if num in chapter_map:
+                log.warn(f"Duplicate nav entry for chapter {num} (from filename): keeping previous entry, ignored '{text}'")
+            else:
+                chapter_map[num] = (text, href)
+            continue
+
+        # else unclassified
+        log.warn(f"Unclassified nav item: text='{text}', href='{href}'")
+
+    return fm_items, chapter_map, index_item
+
+# -----------------------------
+# file resolution helpers
+# -----------------------------
+def find_file_case_insensitive(base_dir: Path, name: str) -> Optional[Path]:
+    if not base_dir.exists():
+        return None
+    candidate = base_dir / name
+    if candidate.exists():
+        return candidate
+    low = name.lower()
+    for p in base_dir.iterdir():
+        if p.is_file() and p.name.lower() == low:
+            return p
     return None
 
-
-def resolve_fm_files(xhtml_dir: Path, log: RunLog) -> List[Path]:
-    out: List[Path] = []
-    for label in FM_CANONICAL_ORDER:
-        cands = FM_RESOLUTION_TABLE.get(label, [])
-        found = find_first_existing(xhtml_dir, cands)
-        if found:
-            out.append(found)
-            log.log(f"FM: '{label}' → {found.name}")
-        else:
-            log.warn(f"FM missing: '{label}' (searched {cands} in {xhtml_dir})")
-    return out
-
-
-def resolve_index_file(xhtml_dir: Path, log: RunLog) -> Optional[Path]:
-    found = find_first_existing(xhtml_dir, BACK_MATTER_INDEX_CANDIDATES)
+def normalize_href_to_actual(href: str, xhtml_dir: Path, log: RunLog) -> str:
+    if not href:
+        return ""
+    href_only = href.split('#', 1)[0].split('?', 1)[0]
+    base = Path(href_only).name
+    if not base:
+        return href
+    found = find_file_case_insensitive(xhtml_dir, base)
     if found:
-        log.log(f"Index resolved → {found.name}")
-    else:
-        log.warn("Index xhtml not found (searched: index(.xhtml|.html))")
-    return found
+        return found.name
+    log.warn(f"Could not resolve href '{href}' to a file in xhtml_dir")
+    return href
 
-
-def write_text(path: Path, text: str):
-    ensure_dir(path.parent)
-    path.write_text(text, encoding="utf-8")
-
-
-def build_zip_structure(temp_dir: Path):
-    ensure_dir(temp_dir / "META-INF")
-    ensure_dir(temp_dir / "OEBPS" / "fonts")
-    ensure_dir(temp_dir / "OEBPS" / "styles")
-    ensure_dir(temp_dir / "OEBPS" / "xhtml")
-    ensure_dir(temp_dir / "OEBPS" / "images")
-    write_text(temp_dir / "mimetype", "application/epub+zip")
-
-
-def zip_directory(src_dir: Path, out_zip: Path):
-    with zipfile.ZipFile(out_zip, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(src_dir):
-            root_p = Path(root)
-            for f in files:
-                fpath = root_p / f
-                arc = fpath.relative_to(src_dir)
-                z.write(fpath, arcname=str(arc))
-
-
-def generate_fm_nav_html(xhtml_dir: Path, log: RunLog) -> str:
-    """Create FM nav.html with: H1 'Contents' + list entries (linked when resolvable)."""
-    def link_if_exists(label: str, stems: List[str]) -> str:
-        tgt = find_first_existing(xhtml_dir, stems)
-        if tgt:
-            return f'<li><a href="{tgt.name}">{label}</a></li>'
+# -----------------------------
+# additional helper: search whole nav raw for anchors to this file
+# -----------------------------
+def find_best_anchor_text_for_href_in_nav(raw_nav_full: str, target_filename: str) -> str:
+    """
+    Search raw nav XHTML text for any <a ... href="...target_filename...">anchor text</a>.
+    Return the best candidate: non-empty, longest, prefer those containing alphabetic characters.
+    Case-insensitive match on filename.
+    """
+    if not raw_nav_full or not target_filename:
+        return ""
+    candidates: List[str] = []
+    for m in A_TAG_PATTERN.finditer(raw_nav_full):
+        attrs = m.group(1)
+        inner = m.group(2)
+        href_m = HREF_PATTERN.search(attrs)
+        if not href_m:
+            opening_tag = m.group(0)[:m.group(0).find('>')]
+            href_m2 = HREF_PATTERN.search(opening_tag)
+            if href_m2:
+                href_val = href_m2.group(1)
+            else:
+                continue
         else:
-            log.warn(f"FM nav: link target missing for '{label}' (searched {stems})")
-            return f"<li>{label}</li>"
+            href_val = href_m.group(1)
+        href_only = href_val.split('#',1)[0].split('?',1)[0]
+        if Path(href_only).name.lower() == target_filename.lower():
+            txt = re.sub(r'<[^>]+>', '', inner).strip()
+            txt = re.sub(r'\s+', ' ', txt)
+            if txt:
+                candidates.append(txt)
+    if not candidates:
+        return ""
+    candidates = sorted(candidates, key=lambda s: (any(c.isalpha() for c in s), len(s)), reverse=True)
+    return candidates[0]
 
-    parts: List[str] = []
-    parts.append("<h1>Contents</h1>")  # headline at the top
-    parts.append("<ul>")
-    parts.append(link_if_exists("Contents", FM_RESOLUTION_TABLE["Contents"]))
-    parts.append(link_if_exists("Cover Page", FM_RESOLUTION_TABLE["Cover Page"]))
-    parts.append(link_if_exists("Half Title Page", FM_RESOLUTION_TABLE["Half Title Page"]))
-    parts.append(link_if_exists("Title Page", FM_RESOLUTION_TABLE["Title Page"]))
-    parts.append(link_if_exists("Copyright", FM_RESOLUTION_TABLE["Copyright"]))
-    parts.append(link_if_exists("About the Editor", FM_RESOLUTION_TABLE["About the Editor"]))
-    parts.append(link_if_exists("About the Contributors", FM_RESOLUTION_TABLE["About the Contributors"]))
-    parts.append("</ul>")
+# -----------------------------
+# pack helper (mimetype uncompressed)
+# -----------------------------
+def pack_epub_dir(src_dir: Path, out_path: Path):
+    with zipfile.ZipFile(out_path, 'w') as z:
+        mimetype_path = src_dir / "mimetype"
+        if mimetype_path.exists():
+            z.writestr("mimetype", mimetype_path.read_bytes(), compress_type=zipfile.ZIP_STORED)
+        for root, _, files in os.walk(src_dir):
+            files_sorted = sorted(files)
+            for f in files_sorted:
+                full = Path(root) / f
+                rel = full.relative_to(src_dir)
+                if str(rel) == "mimetype":
+                    continue
+                z.write(full, arcname=str(rel), compress_type=zipfile.ZIP_DEFLATED)
 
-    html_doc = f"""<!doctype html>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+# -----------------------------
+# create staged epub (returns Path to staged epub)
+# -----------------------------
+def create_staged_epub(epub_name: str, files_map: Dict[Path, Path], meta_inf: Path, fonts_dir: Path, styles_dir: Path, contents_opf: Path, toc_ncx: Path, log: RunLog) -> Path:
+    work = Path(tempfile.mkdtemp(prefix=f"staged-{uuid.uuid4().hex}-"))
+    try:
+        ensure_dir(work / "META-INF")
+        ensure_dir(work / "OEBPS" / "fonts")
+        ensure_dir(work / "OEBPS" / "styles")
+        ensure_dir(work / "OEBPS" / "xhtml")
+        ensure_dir(work / "OEBPS" / "images")
+
+        # copy META-INF, fonts, styles
+        if meta_inf.exists():
+            shutil.copytree(meta_inf, work / "META-INF", dirs_exist_ok=True)
+        if fonts_dir.exists():
+            shutil.copytree(fonts_dir, work / "OEBPS" / "fonts", dirs_exist_ok=True)
+        if styles_dir.exists():
+            shutil.copytree(styles_dir, work / "OEBPS" / "styles", dirs_exist_ok=True)
+
+        # copy specified files
+        for src, rel in files_map.items():
+            dest = work / rel
+            ensure_dir(dest.parent)
+            if src.exists():
+                shutil.copy2(src, dest)
+            else:
+                log.warn(f"Missing file when creating {epub_name}: {src}")
+
+        # copy OPF / NCX if present
+        if contents_opf.exists():
+            shutil.copy2(contents_opf, work / "OEBPS" / "contents.opf")
+        if toc_ncx.exists():
+            shutil.copy2(toc_ncx, work / "OEBPS" / "toc.ncx")
+
+        # mimetype
+        write_text(work / "mimetype", "application/epub+zip")
+
+        staged = Path(tempfile.gettempdir()) / f"{epub_name}-{uuid.uuid4().hex}.epub"
+        pack_epub_dir(work, staged)
+        return staged
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+# -----------------------------
+# staging helpers (return (name, staged_path))
+# -----------------------------
+def stage_chapter_epub(num: int, text: str, href: str, chapter_file: Path, xhtml_dir: Path, images_dir: Path, meta_inf: Path, fonts_dir: Path, styles_dir: Path, contents_opf: Path, toc_ncx: Path, log: RunLog) -> Tuple[str, Path]:
+    epub_name = f"CH{num:02d}.epub"
+    files_map: Dict[Path, Path] = {}
+    files_map[chapter_file] = Path("OEBPS") / "xhtml" / chapter_file.name
+
+    # build nav content for this chapter (match expected format exactly)
+    raw_nav = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Front Matter</title>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+<title>Navigational Table of Contents</title>
+<link rel="stylesheet" type="text/css" href="../styles/stylesheet.css"/>
 </head>
-<body>
-  {''.join(parts)}
+<body epub:type="frontmatter">
+<nav epub:type="toc" id="toc" role="doc-toc" aria-labelledby="contents">
+<h1 id="contents">Contents</h1>
+<ol>
+  <li><a href="{href}">{text}</a></li>
+</ol>
+</nav>
 </body>
 </html>
-"""
-    return html_doc
+'''
+    nav_tmp = Path(tempfile.gettempdir()) / f"nav-{uuid.uuid4().hex}.xhtml"
+    nav_tmp.write_text(sanitize_nav_xhtml(raw_nav), encoding="utf-8")
+    files_map[nav_tmp] = Path("OEBPS") / "xhtml" / "nav.xhtml"
 
+    # copy chapter images named figN_ or figNN_
+    if images_dir.exists():
+        prefix1 = f"fig{num}_"
+        prefix2 = f"fig{num:02d}_"
+        for img in images_dir.iterdir():
+            if not img.is_file(): continue
+            ln = img.name.lower()
+            if ln.startswith(prefix1) or ln.startswith(prefix2):
+                files_map[img] = Path("OEBPS") / "images" / img.name
 
-@dataclass
-class BuildSummary:
-    chapters_built: List[str]
-    fm_built: bool
-    index_built: bool
-    warnings: List[str]
+    staged = create_staged_epub(epub_name, files_map, meta_inf, fonts_dir, styles_dir, contents_opf, toc_ncx, log)
+    return epub_name, staged
 
+def stage_fm_epub(fm_items: List[Tuple[str,str]], fm_files: List[Path], images_dir: Path, meta_inf: Path, fonts_dir: Path, styles_dir: Path, contents_opf: Path, toc_ncx: Path, log: RunLog) -> Tuple[str, Path]:
+    """
+    Deterministic FM nav builder (fixed canonical output).
+    - Uses canonical order and canonical labels.
+    - Looks for filenames (case-insensitive): cover, Half, tit, copy, toc, fm1, fm2
+    - Builds an <ol> with canonical labels and only the files that actually exist in fm_files.
+    """
+    epub_name = "FM.epub"
+    files_map: Dict[Path, Path] = {}
+    for f in fm_files:
+        files_map[f] = Path("OEBPS") / "xhtml" / f.name
 
-def build_all(epub_path: Path, output_root: Path, log: RunLog, progress_cb=None) -> BuildSummary:
-    ensure_dir(output_root)
+    # canonical mapping: filename-key -> label
+    canonical_filenames = [
+        ("cover", "Cover Page"),
+        ("half", "Half Title Page"),
+        ("tit", "Title Page"),
+        ("copy", "Copyright"),
+        ("toc", "Contents"),
+        ("fm1", "About the Editor"),
+        ("fm2", "About the Contributors"),
+    ]
 
-    with tempfile.TemporaryDirectory(prefix="epubsplit-") as tmpd:
-        tmpdir = Path(tmpd)
-        unzipped = unzip_epub(epub_path, tmpdir, log)
+    # create lookup from lowercase basename -> Path
+    fm_lookup = {p.name.lower(): p for p in fm_files}
 
-        # Expected paths
-        meta_inf = unzipped / "META-INF"
-        oebps = unzipped / "OEBPS"
-        xhtml_dir = oebps / "xhtml"
-        styles_dir = oebps / "styles"
-        fonts_dir = oebps / "fonts"
-        images_dir = oebps / "images"
+    # for matching we also want to match startswith or contains (e.g. Half.xhtml, Half.xhtml#pagei resolved earlier)
+    chosen_li: List[str] = []
+    for key, label in canonical_filenames:
+        # try exact basename match first
+        found_path = None
+        for name_lower, p in fm_lookup.items():
+            if name_lower == f"{key}.xhtml" or name_lower == f"{key}.html":
+                found_path = p
+                break
+        # if not exact, try contains key
+        if not found_path:
+            for name_lower, p in fm_lookup.items():
+                if key in name_lower:
+                    # avoid matching chapter files accidentally (key like 'tit' is pretty safe)
+                    found_path = p
+                    break
+        if found_path:
+            chosen_li.append(f'  <li><a href="{found_path.name}">{label}</a></li>')
+
+    # If the canonical loop produced nothing but there are fm_files, fallback to listing them with simple labels
+    if not chosen_li:
+        for p in fm_files:
+            lab = p.stem
+            chosen_li.append(f'  <li><a href="{p.name}">{lab}</a></li>')
+
+    lis = "\n".join(chosen_li)
+
+    raw_nav = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+<title>Navigational Table of Contents</title>
+<link rel="stylesheet" type="text/css" href="../styles/stylesheet.css"/>
+</head>
+<body epub:type="frontmatter">
+<nav epub:type="toc" id="toc" role="doc-toc" aria-labelledby="contents">
+<h1 id="contents">Contents</h1>
+<ol>
+{lis}
+</ol>
+</nav>
+</body>
+</html>
+'''
+    nav_tmp = Path(tempfile.gettempdir()) / f"fm-nav-{uuid.uuid4().hex}.xhtml"
+    nav_tmp.write_text(sanitize_nav_xhtml(raw_nav), encoding="utf-8")
+    files_map[nav_tmp] = Path("OEBPS") / "xhtml" / "nav.xhtml"
+
+    # include non-fig images
+    if images_dir.exists():
+        for img in images_dir.iterdir():
+            if not img.is_file(): continue
+            if re.match(r'^fig\d+_', img.name, re.IGNORECASE): continue
+            files_map[img] = Path("OEBPS") / "images" / img.name
+
+    staged = create_staged_epub(epub_name, files_map, meta_inf, fonts_dir, styles_dir, contents_opf, toc_ncx, log)
+    return epub_name, staged
+
+def stage_index_epub(index_item: Tuple[str,str], index_file: Path, meta_inf: Path, fonts_dir: Path, styles_dir: Path, contents_opf: Path, toc_ncx: Path, log: RunLog) -> Tuple[str, Path]:
+    epub_name = "Index.epub"
+    files_map: Dict[Path, Path] = {}
+    files_map[index_file] = Path("OEBPS") / "xhtml" / index_file.name
+    text, href = index_item
+    raw_nav = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+<title>Navigational Table of Contents</title>
+<link rel="stylesheet" type="text/css" href="../styles/stylesheet.css"/>
+</head>
+<body epub:type="frontmatter">
+<nav epub:type="toc" id="toc" role="doc-toc" aria-labelledby="contents">
+<h1 id="contents">Contents</h1>
+<ol>
+  <li><a href="{href}">{text}</a></li>
+</ol>
+</nav>
+</body>
+</html>
+'''
+    nav_tmp = Path(tempfile.gettempdir()) / f"idx-nav-{uuid.uuid4().hex}.xhtml"
+    nav_tmp.write_text(sanitize_nav_xhtml(raw_nav), encoding="utf-8")
+    files_map[nav_tmp] = Path("OEBPS") / "xhtml" / "nav.xhtml"
+
+    staged = create_staged_epub(epub_name, files_map, meta_inf, fonts_dir, styles_dir, contents_opf, toc_ncx, log)
+    return epub_name, staged
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+def process_single_epub_to_final_zip(input_epub: Path, output_dir: Path, log: RunLog, progress_cb=None) -> dict:
+    ensure_dir(output_dir)
+    log.log(f"Unzipping input EPUB: {input_epub.name}")
+    tmp = Path(tempfile.mkdtemp(prefix="input-unzip-"))
+    try:
+        with zipfile.ZipFile(input_epub, 'r') as zin:
+            zin.extractall(tmp)
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"Failed to unzip input EPUB: {e}")
+
+    try:
+        meta_inf = tmp / "META-INF"
+        oebps = tmp / "OEBPS"
+        xhtml_dir = get_subdir_case_insensitive(oebps, "xhtml")
+        images_dir = get_subdir_case_insensitive(oebps, "images")
+        fonts_dir = get_subdir_case_insensitive(oebps, "fonts")
+        styles_dir = get_subdir_case_insensitive(oebps, "styles")
         contents_opf = oebps / "contents.opf"
         toc_ncx = oebps / "toc.ncx"
 
-        if not xhtml_dir.exists():
-            log.warn(f"Missing OEBPS/xhtml in {unzipped}")
+        nav_html, nav_raw_full = extract_original_nav_and_raw(xhtml_dir, log)
+        items = parse_nav_items_from_nav_html(nav_html)
+        fm_items, chapter_map, index_item = classify_nav_items(items, log)
 
-        chapters = detect_chapters(xhtml_dir, log)
-        total_steps = max(1, len(chapters) + 2)  # + FM + index
+        if DEBUG:
+            log.log(f"DEBUG: parsed nav items count={len(items)} fm_items={fm_items} chapter_map_keys={list(chapter_map.keys())} index_item={index_item}")
+
+        # Normalize hrefs
+        for ch_num, (t, h) in list(chapter_map.items()):
+            chapter_map[ch_num] = (t, normalize_href_to_actual(h or "", xhtml_dir, log))
+        fm_items = [(label, normalize_href_to_actual(h or "", xhtml_dir, log)) for (label, h) in fm_items]
+        if index_item:
+            t, h = index_item
+            index_item = (t, normalize_href_to_actual(h or "", xhtml_dir, log))
+
+        # detect actual chapter files present
+        chapter_files: List[Tuple[int, Path]] = []
+        if xhtml_dir.exists():
+            for p in xhtml_dir.glob("*.*html"):
+                m = CHAPTER_REGEX.match(p.name)
+                if m:
+                    chapter_files.append((int(m.group(1)), p))
+        # also include from chapter_map if not present already
+        for ch_num, (t, href) in chapter_map.items():
+            candidate = None
+            if href:
+                candidate = find_file_case_insensitive(xhtml_dir, href)
+            if candidate is None and xhtml_dir.exists():
+                for p in xhtml_dir.glob("*.*html"):
+                    if re.search(r'\b' + re.escape(str(ch_num)) + r'\b', p.name):
+                        candidate = p
+                        break
+            if candidate and not any(n == ch_num for n, _ in chapter_files):
+                chapter_files.append((ch_num, candidate))
+            elif not candidate:
+                log.warn(f"Chapter {ch_num} referenced in nav but file not found (href='{href}')")
+        chapter_files.sort(key=lambda x: x[0])
+        log.log(f"Detected chapters: {[n for n,_ in chapter_files]}")
+
+        total_steps = max(1, len(chapter_files) + 2)
         step = 0
-
         def bump():
             nonlocal step
             step += 1
             if progress_cb:
                 progress_cb(int(step * 100 / total_steps))
 
-        chapter_zip_names: List[str] = []
+        final_zip = output_dir / "final-output.zip"
+        produced: List[str] = []
+        with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            for num, ch_file in chapter_files:
+                orig = chapter_map.get(num)
+                orig_text = orig[0] if orig else ""
+                orig_href = orig[1] if orig else ""
 
-        # Build per-chapter ZIPs
-        for num, ch_file in chapters:
-            ch_tag = f"ch{num:02d}"
-            with tempfile.TemporaryDirectory(prefix=f"{ch_tag}-") as ch_tmp:
-                ch_dir = Path(ch_tmp)
-                build_zip_structure(ch_dir)
+                href_candidate = normalize_href_to_actual(orig_href or ch_file.name, xhtml_dir, log)
+                extracted = extract_title_from_xhtml(ch_file)
 
-                # Copy constants
-                if meta_inf.exists():
-                    shutil.copytree(meta_inf, ch_dir / "META-INF", dirs_exist_ok=True)
-                if fonts_dir.exists():
-                    shutil.copytree(fonts_dir, ch_dir / "OEBPS" / "fonts", dirs_exist_ok=True)
-                if styles_dir.exists():
-                    shutil.copytree(styles_dir, ch_dir / "OEBPS" / "styles", dirs_exist_ok=True)
+                def _is_short_numeric_or_roman(s: str) -> bool:
+                    s2 = (s or "").strip()
+                    if not s2:
+                        return True
+                    if re.fullmatch(r'\d{1,4}', s2):
+                        return True
+                    if re.fullmatch(r'(?i)(?:m{0,4}(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3}))', s2):
+                        return len(s2) <= 4
+                    if len(s2) <= 2:
+                        return True
+                    return False
 
-                # Chapter XHTML
-                ensure_dir(ch_dir / "OEBPS" / "xhtml")
-                shutil.copy2(ch_file, ch_dir / "OEBPS" / "xhtml" / ch_file.name)
+                chosen_label = ""
+                # 1) prefer orig_text if it is descriptive
+                if orig_text and orig_text.strip():
+                    bare_chap_rx = r'(?ix)^\s*chapter[\s\-–—]*0*' + str(num) + r'[\s\.:,-]*\s*$'
+                    if not re.match(bare_chap_rx, orig_text) and not _is_short_numeric_or_roman(orig_text):
+                        chosen_label = orig_text
 
-                # Chapter images (figNN_*)
-                ensure_dir(ch_dir / "OEBPS" / "images")
-                prefix = IMG_PREFIX_FMT.format(num=num)
-                matched = []
-                if images_dir.exists():
-                    matched = list(images_dir.glob(f"{prefix}*"))
-                    if not matched:
-                        log.warn(f"No images matched for {ch_tag}: prefix '{prefix}'")
-                    for img in matched:
-                        shutil.copy2(img, ch_dir / "OEBPS" / "images" / img.name)
-                else:
-                    log.warn("Images directory missing in input")
+                # 2) fallback: try to find anchors anywhere in the full nav file that target this chapter filename
+                if not chosen_label:
+                    candidate_fname = ""
+                    if orig_href:
+                        candidate_fname = Path(orig_href).name
+                    if not candidate_fname:
+                        candidate_fname = ch_file.name
+                    best_anchor = find_best_anchor_text_for_href_in_nav(nav_raw_full, candidate_fname)
+                    if best_anchor and not _is_short_numeric_or_roman(best_anchor):
+                        chosen_label = best_anchor
 
-                # OPF & NCX copied (MVP copies, no trim)
-                if contents_opf.exists():
-                    shutil.copy2(contents_opf, ch_dir / "OEBPS" / "contents.opf")
-                else:
-                    log.warn("contents.opf missing in input")
-                if toc_ncx.exists():
-                    shutil.copy2(toc_ncx, ch_dir / "OEBPS" / "toc.ncx")
-                else:
-                    log.warn("toc.ncx missing in input")
+                # 3) fallback: prefer extracted visible heading if present
+                if not chosen_label:
+                    if extracted and extracted.strip():
+                        if re.search(r'\bchapter[\s\-–—]*0*' + str(num) + r'\b', extracted, flags=re.IGNORECASE):
+                            chosen_label = extracted
+                        else:
+                            chosen_label = f"Chapter {num} {extracted}"
+                    else:
+                        chosen_label = f"Chapter {num}"
 
-                # Zip → chNN.zip in output_root
-                out_zip = output_root / f"{ch_tag}.zip"
-                zip_directory(ch_dir, out_zip)
-                log.log(f"Wrote {out_zip.name}")
-                chapter_zip_names.append(out_zip.name)
+                text = chosen_label
+                href = normalize_href_to_actual(orig_href or ch_file.name, xhtml_dir, log)
 
+                # Diagnostics
+                diag = f"[CHAPTER {num}] nav='{orig_text}' href='{orig_href}' anchor-scan='{find_best_anchor_text_for_href_in_nav(nav_raw_full, ch_file.name)}' extracted='{extracted}' chosen='{text}'"
+                log.log(diag)
+                if DEBUG:
+                    print(diag)
+
+                epub_name, staged_path = stage_chapter_epub(num, text, href, ch_file, xhtml_dir, images_dir, meta_inf, fonts_dir, styles_dir, contents_opf, toc_ncx, log)
+                try:
+                    zf.write(staged_path, arcname=epub_name)
+                except Exception as e:
+                    log.warn(f"Failed to write {epub_name} into final zip: {e}")
+                    raise
+                try:
+                    staged_path.unlink()
+                except Exception:
+                    pass
+                produced.append(epub_name)
+                log.log(f"Added chapter {num} as {epub_name}")
+                bump()
+
+            # FM — include files whose filenames match FM_KEYWORDS PLUS
+            # any files referenced by fm_items in the nav (e.g. fm1.xhtml, fm2.xhtml)
+            fm_files: List[Path] = []
+            if xhtml_dir.exists():
+                # 1) add files whose filename matches known FM keywords
+                for f in xhtml_dir.glob("*.*html"):
+                    fn = f.name.lower()
+                    for keys in FM_KEYWORDS.values():
+                        for k in keys:
+                            if k in fn:
+                                fm_files.append(f)
+                                break
+
+                # 2) add files referenced by fm_items (nav entries)
+                for item_label, href in fm_items:
+                    if not href:
+                        continue
+                    href_name = Path(href.split('#', 1)[0].split('?', 1)[0]).name
+                    found = find_file_case_insensitive(xhtml_dir, href_name)
+                    if found:
+                        fm_files.append(found)
+                    else:
+                        # fallback: search file contents for the label
+                        for f in xhtml_dir.glob("*.*html"):
+                            try:
+                                txt = f.read_text(encoding="utf-8", errors="ignore")
+                            except Exception:
+                                txt = ""
+                            if item_label and item_label.lower() in txt.lower():
+                                fm_files.append(f)
+                                break
+
+                # 3) optionally include toc.xhtml if present
+                toc_candidate = find_file_case_insensitive(xhtml_dir, "toc.xhtml")
+                if toc_candidate and toc_candidate not in fm_files:
+                    fm_files.append(toc_candidate)
+
+            # deduplicate and sort
+            fm_files = list(sorted({p.resolve(): p for p in fm_files}.values(), key=lambda p: p.name))
+
+            if DEBUG:
+                log.log(f"DEBUG: fm_files found = {[p.name for p in fm_files]} fm_items={fm_items}")
+
+            fm_name, fm_staged = stage_fm_epub(fm_items, fm_files, images_dir, meta_inf, fonts_dir, styles_dir, contents_opf, toc_ncx, log)
+            try:
+                zf.write(fm_staged, arcname=fm_name)
+            except Exception as e:
+                log.warn(f"Failed to write {fm_name} into final zip: {e}")
+                raise
+            try:
+                fm_staged.unlink()
+            except Exception:
+                pass
+            produced.append(fm_name)
+            log.log("Added FM.epub")
             bump()
 
-        # Build FM.zip
-        with tempfile.TemporaryDirectory(prefix="FM-") as fm_tmp:
-            fm_dir = Path(fm_tmp)
-            build_zip_structure(fm_dir)
+            # Index
+            if index_item:
+                t, href = index_item
+                target = (xhtml_dir / href) if (xhtml_dir / href).exists() else None
+                if not target:
+                    for f in xhtml_dir.glob("index.*html"):
+                        target = f
+                        break
+                if target:
+                    idx_name, idx_staged = stage_index_epub(index_item, target, meta_inf, fonts_dir, styles_dir, contents_opf, toc_ncx, log)
+                    try:
+                        zf.write(idx_staged, arcname=idx_name)
+                    except Exception as e:
+                        log.warn(f"Failed to write {idx_name} into final zip: {e}")
+                        raise
+                    try:
+                        idx_staged.unlink()
+                    except Exception:
+                        pass
+                    produced.append(idx_name)
+                    log.log("Added Index.epub")
+                else:
+                    log.warn("Index referenced in nav but file not found; skipping Index.epub")
+            else:
+                log.warn("No Index entry found in nav.xhtml")
 
-            if meta_inf.exists():
-                shutil.copytree(meta_inf, fm_dir / "META-INF", dirs_exist_ok=True)
-            if fonts_dir.exists():
-                shutil.copytree(fonts_dir, fm_dir / "OEBPS" / "fonts", dirs_exist_ok=True)
-            if styles_dir.exists():
-                shutil.copytree(styles_dir, fm_dir / "OEBPS" / "styles", dirs_exist_ok=True)
-
-            # FM XHTMLs
-            fm_files = resolve_fm_files(xhtml_dir, log)
-            for f in fm_files:
-                shutil.copy2(f, fm_dir / "OEBPS" / "xhtml" / f.name)
-
-            # FM nav.html per spec
-            fm_nav_html = generate_fm_nav_html(xhtml_dir, log)
-            write_text(fm_dir / "OEBPS" / "xhtml" / "nav.html", fm_nav_html)
-
-            # FM images: include non-chapter images (exclude fig\d+_)
-            if images_dir.exists():
-                for img in images_dir.iterdir():
-                    if not img.is_file():
-                        continue
-                    if re.match(r"^fig\d+_", img.name, re.IGNORECASE):
-                        continue
-                    ensure_dir(fm_dir / "OEBPS" / "images")
-                    shutil.copy2(img, fm_dir / "OEBPS" / "images" / img.name)
-
-            # OPF & NCX copied
-            if contents_opf.exists():
-                shutil.copy2(contents_opf, fm_dir / "OEBPS" / "contents.opf")
-            if toc_ncx.exists():
-                shutil.copy2(toc_ncx, fm_dir / "OEBPS" / "toc.ncx")
-
-            out_zip = output_root / "FM.zip"
-            zip_directory(fm_dir, out_zip)
-            log.log("Wrote FM.zip")
-
-        bump()
-
-        # Build index.zip — copy existing index.(x)html only; no generated nav
-        index_src = resolve_index_file(xhtml_dir, log)
-        index_built = False
-        if index_src:
-            with tempfile.TemporaryDirectory(prefix="INDEX-") as idx_tmp:
-                idx_dir = Path(idx_tmp)
-                build_zip_structure(idx_dir)
-
-                if meta_inf.exists():
-                    shutil.copytree(meta_inf, idx_dir / "META-INF", dirs_exist_ok=True)
-                if fonts_dir.exists():
-                    shutil.copytree(fonts_dir, idx_dir / "OEBPS" / "fonts", dirs_exist_ok=True)
-                if styles_dir.exists():
-                    shutil.copytree(styles_dir, idx_dir / "OEBPS" / "styles", dirs_exist_ok=True)
-
-                shutil.copy2(index_src, idx_dir / "OEBPS" / "xhtml" / index_src.name)
-
-                if contents_opf.exists():
-                    shutil.copy2(contents_opf, idx_dir / "OEBPS" / "contents.opf")
-                if toc_ncx.exists():
-                    shutil.copy2(toc_ncx, idx_dir / "OEBPS" / "toc.ncx")
-
-                out_zip = output_root / "index.zip"
-                zip_directory(idx_dir, out_zip)
-                log.log("Wrote index.zip")
-                index_built = True
-        else:
-            log.warn("index.zip skipped: index xhtml not found")
-
-        bump()
-
-        # Create master final-output.zip that contains all produced .zip files
-        all_zips = [str(p.name) for p in sorted(output_root.glob("*.zip"))]
-        final_zip = output_root / "final-output.zip"
-        with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED) as fzip:
-            for name in all_zips:
-                fzip.write(output_root / name, arcname=name)
-        log.log(f"Master package written → {final_zip.name}")
-
-        # write logs + summary
-        log.dump_files(output_root)
-        summary = BuildSummary(
-            chapters_built=[n for n in chapter_zip_names],
-            fm_built=True,
-            index_built=index_built,
-            warnings=log.warnings,
-        )
-        (output_root / "summary.json").write_text(json.dumps(asdict(summary), indent=2), encoding="utf-8")
-
+        summary = {"produced": produced, "warnings": log.warnings, "bundle": str(final_zip)}
+        (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        log.dump(output_dir)
+        log.log(f"Created final bundle: {final_zip.name}")
         return summary
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 # -----------------------------
-# GUI
+# Minimal GUI (unchanged)
 # -----------------------------
-class EpubSplitterApp(QWidget):
+class App(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EPUB → ZIP Splitter (Final App)")
-        self.setMinimumSize(1000, 640)
+        self.setWindowTitle("EPUB → final-output.zip")
+        self.setMinimumSize(920, 560)
         self.log = RunLog(messages=[], warnings=[])
-        self.init_ui()
+        self._init_ui()
 
-    def init_ui(self):
+    def _init_ui(self):
         root = QHBoxLayout(self)
 
-        # Sidebar
-        sidebar = QVBoxLayout(); sidebar.setAlignment(Qt.AlignTop)
-        title = QLabel("📘 EPUB → ZIP Splitter")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; margin-bottom: 12px;")
-        sidebar.addWidget(title)
-        for s in ["1️⃣ Select EPUB", "2️⃣ Output & Options", "3️⃣ Run", "4️⃣ Results"]:
-            lbl = QLabel("• " + s)
-            lbl.setStyleSheet("font-size: 15px; margin: 4px 0;")
-            sidebar.addWidget(lbl)
-        sidebar.addStretch()
-        root.addLayout(sidebar, 1)
+        left = QVBoxLayout(); left.setAlignment(Qt.AlignTop)
+        left.addWidget(QLabel("Input EPUB (single file):"))
+        self.input_line = QLineEdit(); left.addWidget(self.input_line)
+        btn_in = QPushButton("Browse EPUB..."); btn_in.clicked.connect(self.browse_epub); left.addWidget(btn_in)
 
-        # Pages
-        self.pages = QStackedWidget()
-        self.pages.addWidget(self.page_select())
-        self.pages.addWidget(self.page_options())
-        self.pages.addWidget(self.page_run())
-        self.pages.addWidget(self.page_results())
-        root.addWidget(self.pages, 4)
+        left.addSpacing(8)
+        left.addWidget(QLabel("Output folder (final-output.zip will be placed here):"))
+        self.output_line = QLineEdit("final-output"); left.addWidget(self.output_line)
+        btn_out = QPushButton("Browse Output Folder..."); btn_out.clicked.connect(self.browse_output); left.addWidget(btn_out)
 
-    # ---- Pages ----
-    def page_select(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("Select an EPUB file:"))
-        self.input_path = QLineEdit(); self.input_path.setPlaceholderText("/path/to/book.epub")
-        btn = QPushButton("Browse EPUB…"); btn.clicked.connect(self.on_browse_epub)
-        lay.addWidget(self.input_path); lay.addWidget(btn)
-        self.info_detect = QLabel("")
-        self.info_detect.setStyleSheet("color:#666;")
-        lay.addWidget(self.info_detect)
-        next_btn = QPushButton("Next →"); next_btn.clicked.connect(lambda: self.pages.setCurrentIndex(1))
-        lay.addWidget(next_btn, alignment=Qt.AlignRight)
-        return w
+        left.addSpacing(12)
+        self.start_btn = QPushButton("▶ Start (Create final-output.zip)")
+        self.start_btn.clicked.connect(self.on_start); left.addWidget(self.start_btn)
+        left.addStretch()
+        root.addLayout(left, 1)
 
-    def page_options(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("Output Folder:"))
-        self.output_path = QLineEdit("final-output")
-        out_btn = QPushButton("Select Folder…"); out_btn.clicked.connect(self.on_browse_output)
-        lay.addWidget(self.output_path); lay.addWidget(out_btn)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Progress:"))
+        self.progress = QProgressBar(); self.progress.setValue(0); right.addWidget(self.progress)
+        right.addWidget(QLabel("Console:"))
+        self.console = QTextEdit(); self.console.setReadOnly(True); right.addWidget(self.console)
+        right.addWidget(QLabel("Generated files:"))
+        self.results = QListWidget(); right.addWidget(self.results)
+        root.addLayout(right, 2)
 
-        lay.addWidget(QLabel("What to generate:"))
-        self.chk_chapters = QCheckBox("Per-chapter ZIPs"); self.chk_chapters.setChecked(True)
-        self.chk_fm = QCheckBox("FM.zip (Front Matter)"); self.chk_fm.setChecked(True)
-        self.chk_index = QCheckBox("index.zip (Index)"); self.chk_index.setChecked(True)
-        for chk in (self.chk_chapters, self.chk_fm, self.chk_index):
-            lay.addWidget(chk)
+        self.setLayout(root)
 
-        lay.addWidget(QLabel("Detection Rule (regex for chapter files):"))
-        self.rule = QLineEdit(r"^(?:ch|chp)[-_]?(\d{2,3})\.(xhtml|html)$")
-        lay.addWidget(self.rule)
+    def browse_epub(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Select EPUB", "", "EPUB Files (*.epub)")
+        if p:
+            self.input_line.setText(p)
+            self.quick_scan(p)
 
-        next_btn = QPushButton("Next →"); next_btn.clicked.connect(lambda: self.pages.setCurrentIndex(2))
-        lay.addWidget(next_btn, alignment=Qt.AlignRight)
-        return w
+    def browse_output(self):
+        p = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if p:
+            self.output_line.setText(p)
 
-    def page_run(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("Run"))
-        self.progress = QProgressBar(); self.progress.setValue(0)
-        lay.addWidget(self.progress)
-        self.console = QTextEdit(); self.console.setReadOnly(True)
-        lay.addWidget(self.console)
-        start_btn = QPushButton("▶ Start Processing")
-        start_btn.clicked.connect(self.on_start)
-        lay.addWidget(start_btn, alignment=Qt.AlignCenter)
-        next_btn = QPushButton("Next →"); next_btn.clicked.connect(lambda: self.pages.setCurrentIndex(3))
-        lay.addWidget(next_btn, alignment=Qt.AlignRight)
-        return w
-
-    def page_results(self):
-        w = QWidget(); lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("Results"))
-        self.results_list = QListWidget(); lay.addWidget(self.results_list)
-        open_btn = QPushButton("📂 Open Output Folder")
-        open_btn.clicked.connect(self.on_open_output)
-        lay.addWidget(open_btn, alignment=Qt.AlignCenter)
-        restart_btn = QPushButton("← Back to Start")
-        restart_btn.clicked.connect(lambda: self.pages.setCurrentIndex(0))
-        lay.addWidget(restart_btn, alignment=Qt.AlignRight)
-        return w
-
-    # ---- Handlers ----
-    def on_browse_epub(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select EPUB", "", "EPUB Files (*.epub)")
-        if not path:
-            return
-        self.input_path.setText(path)
-        # Light scan just to show quick info
+    def quick_scan(self, epub_path):
         try:
-            with tempfile.TemporaryDirectory(prefix="scan-") as t:
-                tmp = Path(t)
-                with zipfile.ZipFile(path, 'r') as z:
+            with tempfile.TemporaryDirectory(prefix="scan-") as td:
+                tmp = Path(td)
+                with zipfile.ZipFile(epub_path, 'r') as z:
                     z.extractall(tmp)
-                xhtml_dir = tmp / "OEBPS" / "xhtml"
+                xhtml_dir = get_subdir_case_insensitive(tmp / "OEBPS", "xhtml")
                 if xhtml_dir.exists():
-                    chapters = [p.name for p in xhtml_dir.glob("*.*html") if CHAPTER_REGEX.match(p.name)]
+                    chs = [p.name for p in xhtml_dir.glob("*.*html") if CHAPTER_REGEX.match(p.name)]
                     others = [p.name for p in xhtml_dir.glob("*.*html") if not CHAPTER_REGEX.match(p.name)]
-                    self.info_detect.setText(
-                        f"Chapters detected: {', '.join(sorted(chapters)) or 'none'}\nOther XHTML: {', '.join(sorted(others)[:10])}{' …' if len(others)>10 else ''}"
-                    )
+                    self.console.append(f"Quick scan - Chapters: {', '.join(sorted(chs)) or 'none'}")
+                    self.console.append(f"Quick scan - Other XHTML: {', '.join(sorted(others)[:10])}{' …' if len(others) > 10 else ''}")
                 else:
-                    self.info_detect.setText("No OEBPS/xhtml/ found in EPUB")
+                    self.console.append("Quick scan - OEBPS/xhtml not found")
         except Exception as e:
-            self.info_detect.setText(f"Failed to scan EPUB: {e}")
+            self.console.append(f"Quick scan failed: {e}")
 
-    def on_browse_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
-        if path:
-            self.output_path.setText(path)
+    def append_console(self, s: str):
+        self.console.append(s)
+        QApplication.processEvents()
 
     def on_start(self):
-        epub = Path(self.input_path.text().strip())
-        out = Path(self.output_path.text().strip() or "final-output")
-        if not epub.exists():
-            self.append_console("Please select a valid EPUB file.")
+        inp = self.input_line.text().strip()
+        out = self.output_line.text().strip() or "final-output"
+        if not inp:
+            self.append_console("Select an input EPUB first.")
             return
-        out.mkdir(parents=True, exist_ok=True)
+        epub_path = Path(inp)
+        if not epub_path.exists():
+            self.append_console("Input EPUB does not exist.")
+            return
+        output_dir = Path(out)
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.append_console(f"Could not create output folder: {e}")
+            return
 
         # Reset UI
-        self.console.clear()
-        self.progress.setValue(0)
-        self.results_list.clear()
+        self.console.clear(); self.results.clear(); self.progress.setValue(0)
         self.log = RunLog(messages=[], warnings=[])
 
-        def progress_cb(pct: int):
-            self.progress.setValue(pct)
-            QApplication.processEvents()
+        def progress_cb(pct:int):
+            self.progress.setValue(pct); QApplication.processEvents()
 
         try:
-            summary = build_all(epub, out, self.log, progress_cb=progress_cb)
+            summary = process_single_epub_to_final_zip(epub_path, output_dir, self.log, progress_cb=progress_cb)
         except Exception as e:
             self.append_console(f"ERROR: {e}")
             return
 
-        # Show results
+        if (output_dir / "run-log.txt").exists():
+            try:
+                txt = (output_dir / "run-log.txt").read_text(encoding="utf-8", errors="ignore")
+                for line in txt.splitlines():
+                    self.append_console(line)
+            except Exception:
+                pass
+
         self.append_console("=== SUMMARY ===")
-        self.append_console(json.dumps(asdict(summary), indent=2))
-        for z in sorted(out.glob("*.zip")):
-            self.results_list.addItem(z.name)
-        self.append_console(f"Output written to: {out.resolve()}")
-
-    def on_open_output(self):
-        path = self.output_path.text().strip()
-        if not path:
-            return
-        if sys.platform.startswith('win'):
-            os.startfile(path)
-        elif sys.platform == 'darwin':
-            os.system(f'open "{path}"')
-        else:
-            os.system(f'xdg-open "{path}"')
-
-    def append_console(self, text: str):
-        self.console.append(text)
-        QApplication.processEvents()
+        self.append_console(json.dumps(summary, indent=2))
+        if (output_dir / "final-output.zip").exists():
+            self.results.addItem("final-output.zip")
+        self.append_console(f"Done. final-output.zip placed at: {output_dir.resolve()}")
 
 # -----------------------------
-# Main
+# Run
 # -----------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = EpubSplitterApp()
+    win = App()
     win.show()
     sys.exit(app.exec())
